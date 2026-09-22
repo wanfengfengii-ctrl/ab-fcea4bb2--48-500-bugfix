@@ -8,6 +8,25 @@ import pytest
 
 from app.solver import solve_mask_assignment
 
+_SEED_750_EXPECTED = [
+    0, 0, 0, 1, 0, 2, 0, 1, 1, 1, 0, 0, 2, 0, 1, 1, 0, 1, 0, 2, 2, 1,
+    0, 0, 0, 0, 0, 1, 2, 2, 1, 0, 0, 1, 2, 0, 2, 0, 0, 1, 2, 1, 2, 2,
+    2, 1, 1, 0,
+]
+
+
+def _seed_750_instance():
+    """48 fragments, 88 conflicts from seed 750 at p=0.075."""
+    rng = random.Random(750)
+    fragments = list(range(48))
+    conflicts = []
+    for a in range(48):
+        for b in range(a + 1, 48):
+            if rng.random() < 0.075:
+                conflicts.append([a, b])
+    assert len(conflicts) == 88
+    return fragments, conflicts
+
 
 def brute_force(fragments, conflict_edges, stitch_edges):
     """Enumerate all canonical colorings; returns (best_cost, solutions)."""
@@ -147,3 +166,67 @@ def test_random_instances_match_brute_force(seed):
         elif roll < 0.5:
             stitches.append([a, b, rng.randint(1, 9)])
     check_against_brute_force(fragments, conflicts, stitches)
+
+
+@pytest.mark.parametrize("seed", range(20))
+def test_random_instances_with_huge_weights_match_brute_force(seed):
+    # Weights beyond the exact-MILP domain force the pure integer engine;
+    # every legal positive integer weight must compare exactly.
+    rng = random.Random(2000 + seed)
+    n = rng.randint(4, 9)
+    fragments = sorted(rng.sample(range(1, 60), n))
+    pairs = [
+        (fragments[i], fragments[j])
+        for i in range(n)
+        for j in range(i + 1, n)
+    ]
+    rng.shuffle(pairs)
+    conflicts, stitches = [], []
+    for a, b in pairs:
+        roll = rng.random()
+        if roll < 0.25:
+            conflicts.append([a, b])
+        elif roll < 0.5:
+            stitches.append([a, b, rng.choice([10**9 + 1, 10**12 + 7, 10**30 + 3])])
+    check_against_brute_force(fragments, conflicts, stitches)
+
+
+def test_seed750_huge_weights_return_zero_optimum():
+    # Regression: legal large integer weights pushed the instance onto the
+    # exact search, whose fixed id-order enumeration exhausted its budget and
+    # surfaced as HTTP 500.  Both stitch endpoints can keep the same mask, so
+    # the canonical optimum is 0 regardless of the weight magnitude.
+    fragments, conflicts = _seed_750_instance()
+    stitches = [[0, 1, 1_000_000_001], [27, 30, 1_000_000_002]]
+    assert all(tuple(sorted((a, b))) != (0, 1) for a, b in conflicts)
+    assert all(tuple(sorted((a, b))) != (27, 30) for a, b in conflicts)
+
+    result = solve_mask_assignment(fragments, conflicts, stitches)
+    assert result["status"] == "optimal"
+    assert result["objective"] == 0
+    assert result["unique"] is False
+    assert result["cut_stitches"] == []
+    seq = [result["assignment"][str(i)] for i in fragments]
+    assert seq == _SEED_750_EXPECTED
+    # A second, equally optimal canonical witness must be returned.
+    witness = result["witness"]
+    assert witness is not None
+    wseq = [witness["assignment"][str(i)] for i in fragments]
+    assert wseq != seq
+    assert witness["cut_stitches"] == []
+    assert all(wseq[a] != wseq[b] for a, b in conflicts)
+    assert wseq[0] == wseq[1] and wseq[27] == wseq[30]
+
+
+def test_seed750_small_weight_control_matches_huge_weights():
+    # Same fragments and conflict structure, small weights: the answer must
+    # be identical (zero is attainable either way).
+    fragments, conflicts = _seed_750_instance()
+    small = solve_mask_assignment(fragments, conflicts, [[0, 1, 1], [27, 30, 2]])
+    huge = solve_mask_assignment(
+        fragments, conflicts, [[0, 1, 1_000_000_001], [27, 30, 1_000_000_002]]
+    )
+    assert small["status"] == huge["status"] == "optimal"
+    assert small["objective"] == huge["objective"] == 0
+    assert small["assignment"] == huge["assignment"]
+    assert [small["assignment"][str(i)] for i in fragments] == _SEED_750_EXPECTED
