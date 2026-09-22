@@ -147,3 +147,88 @@ def test_random_instances_match_brute_force(seed):
         elif roll < 0.5:
             stitches.append([a, b, rng.randint(1, 9)])
     check_against_brute_force(fragments, conflicts, stitches)
+
+
+# Weights above the MILP-exact range route through the exact integer engine;
+# they must keep exact ordering semantics at any magnitude.
+_HUGE_WEIGHTS = [10**9 + 1, 10**18, 2**64, 10**40 + 7]
+
+
+@pytest.mark.parametrize("weight", _HUGE_WEIGHTS)
+def test_huge_weights_match_brute_force(weight):
+    rng = random.Random(2024)
+    n = rng.randint(4, 8)
+    fragments = sorted(rng.sample(range(1, 60), n))
+    pairs = [
+        (fragments[i], fragments[j])
+        for i in range(n)
+        for j in range(i + 1, n)
+    ]
+    rng.shuffle(pairs)
+    conflicts, stitches = [], []
+    for a, b in pairs:
+        roll = rng.random()
+        if roll < 0.25:
+            conflicts.append([a, b])
+        elif roll < 0.5:
+            # Huge weights dominate so the optimum behaves like a small
+            # lexicographic perturbation of weight 1; brute force computes
+            # the same answer in exact integer arithmetic.
+            stitches.append([a, b, weight + rng.randint(0, 1000)])
+    check_against_brute_force(fragments, conflicts, stitches)
+
+
+def test_seed_750_forty_eight_fragment_instance_with_huge_weights():
+    """Regression: a legal weight just above 10**9 must not turn a trivially
+    zero-optimal instance into a solver timeout (previously the exact
+    branch-and-bound thrashed on the 3-coloring subproblem)."""
+    rng = random.Random(750)
+    fragments = list(range(48))
+    conflicts = [
+        [a, b]
+        for a in range(48)
+        for b in range(a + 1, 48)
+        if rng.random() < 0.075
+    ]
+    assert len(conflicts) == 88
+    stitches = [[0, 1, 1_000_000_001], [27, 30, 1_000_000_002]]
+
+    result = solve_mask_assignment(fragments, conflicts, stitches)
+    assert result["status"] == "optimal"
+    assert result["objective"] == 0
+    assert result["cut_stitches"] == []
+    assert result["unique"] is False
+
+    expected = [
+        0, 0, 0, 1, 0, 2, 0, 1, 1, 1, 0, 0, 2, 0, 1, 1,
+        0, 1, 0, 2, 2, 1, 0, 0, 0, 0, 0, 1, 2, 2, 1, 0,
+        0, 1, 2, 0, 2, 0, 0, 1, 2, 1, 2, 2, 2, 1, 1, 0,
+    ]
+    seq = [result["assignment"][str(i)] for i in fragments]
+    assert seq == expected
+
+    # The returned coloring really is a proper coloring honoring both
+    # stitches, and it is canonical.
+    pos = {f: i for i, f in enumerate(fragments)}
+    for a, b in conflicts:
+        assert seq[pos[a]] != seq[pos[b]]
+    assert seq[0] == seq[1] and seq[27] == seq[30]
+    next_color = 0
+    for color in seq:
+        assert color <= next_color
+        next_color = max(next_color, color + 1)
+
+    witness = result["witness"]
+    assert witness is not None
+    wseq = [witness["assignment"][str(i)] for i in fragments]
+    assert wseq != seq
+    for a, b in conflicts:
+        assert wseq[pos[a]] != wseq[pos[b]]
+    assert wseq[0] == wseq[1] and wseq[27] == wseq[30]
+    assert witness["cut_stitches"] == []
+
+    # The same instance with weights 1 and 2 must yield the same optimum.
+    small = solve_mask_assignment(fragments, conflicts, [[0, 1, 1], [27, 30, 2]])
+    assert small["status"] == "optimal"
+    assert small["objective"] == 0
+    assert [small["assignment"][str(i)] for i in fragments] == expected

@@ -197,14 +197,26 @@ def _solve_milp(order, conflict_edges, stitches):
 class _ExactSearch:
     """Branch-and-bound over canonical colorings in exact integer arithmetic.
 
-    Fragments are colored in ascending id order; at each step the usable
-    masks are those not forbidden by already-colored conflict neighbors and
-    not beyond the canonical first-occurrence order.  The lower bound is
-    the exact cut weight inside the colored prefix plus, for every
-    uncolored fragment, the cheapest cut weight its already-colored stitch
-    neighbors force on its best remaining mask (edges between two uncolored
-    fragments contribute nothing).  All quantities are Python integers, so
-    stitch weights of any size compare exactly.
+    Variables are chosen dynamically (minimum remaining values: the
+    uncolored fragment with the smallest still-feasible mask set), which is
+    essential on sparse graphs — a fixed id order can paint itself into a
+    corner three-coloring and spend millions of nodes backing out.  Values
+    are tried by cheapest forced cut first and then least constraining for
+    conflict neighbors.
+
+    The canonical first-occurrence rules ("mask k may appear at fragment v
+    only when a smaller-id fragment takes mask k - 1") are enforced in an
+    assignment-order-independent way so dynamic MRV stays exact: each node
+    computes, in ascending id order, which masks can still satisfy their
+    prerequisite through an uncolored smaller fragment.  An assignment
+    whose own prerequisite later becomes impossible prunes the branch.
+
+    The lower bound is the exact cut weight among colored fragments plus,
+    for every uncolored fragment, the cheapest cut weight its colored
+    stitch neighbors force on its best remaining mask (edges between two
+    uncolored fragments contribute nothing).  Domains only shrink along a
+    branch, so the bound stays admissible.  All quantities are Python
+    integers, so stitch weights of any size compare exactly.
     """
 
     def __init__(self, order, conflict_edges, stitches):
@@ -223,16 +235,11 @@ class _ExactSearch:
             self.st[ib].append((ia, w))
         self.total = sum(w for _a, _b, w in stitches)
         self.colors = [-1] * n
-        self.allowed = [7] * n  # bitmask of masks not ruled out by conflicts
+        self.allowed = [7] * n  # conflict-domain bitmask of masks
         # cut_if[j][k]: weight of edges from colored neighbors of j that
         # would be cut if j took mask k.
         self.cut_if = [[0, 0, 0] for _ in range(n)]
-        # marginal[j]: cheapest such weight over the masks still allowed
-        # for j; bound_sum sums it over the uncolored fragments.
-        self.marginal = [0] * n
-        self.bound_sum = 0
-        self.cost = 0  # exact cut weight inside the colored prefix
-        self.max_used = -1
+        self.cost = 0  # exact cut weight among colored fragments
         self.limit = self.total + 1  # prune when cost + bound >= limit
         self.hit = lambda cost: None
         self.stop = False
@@ -241,79 +248,126 @@ class _ExactSearch:
 
     # -- incremental state maintenance -----------------------------------
 
-    def _place(self, i, k):
-        """Color fragment i with mask k; returns an undo token or ``None``
+    def _place(self, v, k):
+        """Color fragment v with mask k; returns an undo token or ``None``
         if the placement makes the instance infeasible."""
         colors = self.colors
-        for j in self.conf[i]:
-            if j < i and colors[j] == k:
+        for u in self.conf[v]:
+            if colors[u] == k:
                 return None
-        rec = [("bs", self.bound_sum), ("cost", self.cost), ("mu", self.max_used)]
-        colors[i] = k
-        if k > self.max_used:
-            self.max_used = k
+        rec = [("v", v), ("cost", self.cost)]
+        colors[v] = k
         added = 0
-        st_i = self.st[i]
-        for j, w in st_i:
-            if j < i and colors[j] != k:
+        for u, w in self.st[v]:
+            if colors[u] >= 0 and colors[u] != k:
                 added += w
         self.cost += added
-        # Fragment i leaves the uncolored pool.
-        rec.append(("marg", i, self.marginal[i]))
-        self.bound_sum -= self.marginal[i]
-        self.marginal[i] = 0
-        # Edges from i to uncolored neighbors join their forced-cut terms.
-        for j, w in st_i:
-            if j > i:
-                cj = self.cut_if[j]
+        # Edges from v to uncolored neighbors join their forced-cut terms.
+        for u, w in self.st[v]:
+            if colors[u] < 0:
+                rec.append(("st", u, w, k))
+                cu = self.cut_if[u]
                 for b in MASKS:
                     if b != k:
-                        cj[b] += w
-                rec.append(("marg", j, self.marginal[j]))
-                new_m = min(cj[b] for b in MASKS if (self.allowed[j] >> b) & 1)
-                self.bound_sum += new_m - self.marginal[j]
-                self.marginal[j] = new_m
+                        cu[b] += w
         # Mask k becomes forbidden for uncolored conflict neighbors.
-        for j in self.conf[i]:
-            if j > i and (self.allowed[j] >> k) & 1:
-                rec.append(("allowed", j, self.allowed[j]))
-                self.allowed[j] &= ~(1 << k)
-                if self.allowed[j] == 0:
-                    self._undo(i, rec)
-                    return None
-                rec.append(("marg", j, self.marginal[j]))
-                new_m = min(
-                    self.cut_if[j][b] for b in MASKS if (self.allowed[j] >> b) & 1
-                )
-                self.bound_sum += new_m - self.marginal[j]
-                self.marginal[j] = new_m
+        wiped = False
+        for u in self.conf[v]:
+            if colors[u] < 0 and (self.allowed[u] >> k) & 1:
+                rec.append(("dom", u, self.allowed[u]))
+                self.allowed[u] &= ~(1 << k)
+                if self.allowed[u] == 0:
+                    wiped = True
+        if wiped:
+            self._undo(rec)
+            return None
         return rec
 
-    def _undo(self, i, rec):
-        k = self.colors[i]
-        for j, w in self.st[i]:
-            if j > i:
-                cj = self.cut_if[j]
+    def _undo(self, rec):
+        v = rec[0][1]
+        for item in reversed(rec[1:]):
+            tag = item[0]
+            if tag == "dom":
+                self.allowed[item[1]] = item[2]
+            elif tag == "st":
+                _t, u, w, k = item
+                cu = self.cut_if[u]
                 for b in MASKS:
                     if b != k:
-                        cj[b] -= w
-        for item in reversed(rec):
-            tag = item[0]
-            if tag == "marg":
-                self.marginal[item[1]] = item[2]
-            elif tag == "allowed":
-                self.allowed[item[1]] = item[2]
-            elif tag == "bs":
-                self.bound_sum = item[1]
+                        cu[b] -= w
             elif tag == "cost":
                 self.cost = item[1]
-            else:  # "mu"
-                self.max_used = item[1]
-        self.colors[i] = -1
+        self.colors[v] = -1
 
-    # -- depth-first search -----------------------------------------------
+    # -- node analysis ------------------------------------------------------
 
-    def _dfs(self, i):
+    def _analyze(self):
+        """Feasible domains, cost bound and MRV variable for this node.
+
+        Returns ``(domains, lower_bound, mrv_var)`` or ``None`` when the
+        node is already infeasible (empty domain or a colored fragment
+        whose canonical prerequisite can no longer hold).  When every
+        fragment is colored ``mrv_var`` is ``None``.
+        """
+        n = self.n
+        colors = self.colors
+        allowed = self.allowed
+
+        # enabled[u]: masks whose canonical prerequisite is satisfied by,
+        # or still achievable through, fragments with id below u.  The
+        # ascending sweep propagates the chain 0 -> 1 -> 2.
+        enabled = [0] * n
+        can1 = can2 = False
+        for u in range(n):
+            en = 1
+            if can1:
+                en |= 2
+            if can2:
+                en |= 4
+            enabled[u] = en
+            c = colors[u]
+            if c == 0:
+                can1 = True
+            elif c == 1:
+                can2 = True
+            elif c < 0:
+                d = allowed[u]
+                if d & 1:
+                    can1 = True
+                if (d & 2) and (en & 2):
+                    can2 = True
+
+        domains = [0] * n
+        bound = 0
+        mrv_var = None
+        mrv_key = None
+        for u in range(n):
+            c = colors[u]
+            if c >= 0:
+                # A colored fragment's own prerequisite must still hold.
+                if c >= 1 and not ((enabled[u] >> c) & 1):
+                    return None
+                continue
+            d = allowed[u] & enabled[u]
+            if d == 0:
+                return None
+            domains[u] = d
+            ci = self.cut_if[u]
+            bound += min(ci[b] for b in MASKS if (d >> b) & 1)
+            key = (
+                d.bit_count(),
+                -sum(1 for j in self.conf[u] if colors[j] < 0),
+                -sum(1 for j, _w in self.st[u] if colors[j] < 0),
+                u,
+            )
+            if mrv_key is None or key < mrv_key:
+                mrv_key = key
+                mrv_var = u
+        return domains, bound, mrv_var
+
+    # -- depth-first search -------------------------------------------------
+
+    def _dfs(self):
         if self.stop:
             return
         self.nodes += 1
@@ -321,35 +375,38 @@ class _ExactSearch:
             raise _SearchExhausted
         if self.nodes & 4095 == 0 and time.monotonic() > self.deadline:
             raise _SearchExhausted
-        if self.cost + self.bound_sum >= self.limit:
+
+        info = self._analyze()
+        if info is None:
             return
-        if i == self.n:
+        domains, bound, v = info
+        if self.cost + bound >= self.limit:
+            return
+        if v is None:
             self.hit(self.cost)
             return
-        max_color = self.max_used + 1
-        if max_color > 2:
-            max_color = 2
-        ai = self.allowed[i]
+
         colors = self.colors
-        st_i = self.st[i]
-        # Cheapest added cut weight first finds good incumbents early;
-        # ties break by mask id so the search is deterministic.
         cands = []
         for k in MASKS:
-            if k > max_color or not (ai >> k) & 1:
+            if not ((domains[v] >> k) & 1):
                 continue
-            added = 0
-            for j, w in st_i:
-                if j < i and colors[j] != k:
-                    added += w
-            cands.append((added, k))
+            added = sum(
+                w for u, w in self.st[v] if colors[u] >= 0 and colors[u] != k
+            )
+            # Least constraining: assigning mask k forbids it for exactly
+            # the uncolored conflict neighbors still offering k.
+            forbids = sum(
+                1 for u in self.conf[v] if colors[u] < 0 and (self.allowed[u] >> k) & 1
+            )
+            cands.append((added, forbids, k))
         cands.sort()
-        for _added, k in cands:
-            rec = self._place(i, k)
+        for _added, _forbids, k in cands:
+            rec = self._place(v, k)
             if rec is None:
                 continue
-            self._dfs(i + 1)
-            self._undo(i, rec)
+            self._dfs()
+            self._undo(rec)
             if self.stop:
                 return
 
@@ -363,18 +420,19 @@ class _ExactSearch:
 
         def hit(cost):
             self.best = cost
-            self.limit = cost
+            self.limit = cost  # keep searching for something strictly better
             if cost == 0:
                 self.stop = True
 
         self.hit = hit
-        self._dfs(0)
+        self._dfs()
         return self.best
 
-    def _feasible_from(self, start, limit_cost):
+    def _feasible_from(self, cap):
         """Whether the current prefix extends to a coloring of cost at most
-        ``limit_cost``."""
-        self.limit = limit_cost + 1
+        ``cap``.  Explorations inside the probe are fully undone, leaving
+        the prefix intact."""
+        self.limit = cap + 1
         self.stop = False
         self.found = False
 
@@ -383,34 +441,46 @@ class _ExactSearch:
             self.stop = True
 
         self.hit = hit
-        self._dfs(start)
+        self._dfs()
         return self.found
 
     def lexmin(self, best_cost):
-        """Lexicographically smallest canonical coloring of cost ``best_cost``."""
+        """Lexicographically smallest canonical coloring of cost
+        ``best_cost``.
+
+        Fragments are pinned in ascending id order; for each position the
+        smallest mask extendable to an optimum is committed.  The returned
+        undo tokens leave every placement in place; the caller undoes them
+        before running further phases.
+        """
         colors = []
         pinned = []
         try:
-            for i in range(self.n):
+            for v in range(self.n):
+                info = self._analyze()
+                if info is None:  # pragma: no cover - best_cost is achievable
+                    raise SolverError("求解器在构造字典序最小方案时失败")
+                domains = info[0]
                 chosen = None
                 for k in MASKS:
-                    if k > min(self.max_used + 1, 2) or not (self.allowed[i] >> k) & 1:
+                    if not ((domains[v] >> k) & 1):
                         continue
-                    rec = self._place(i, k)
+                    rec = self._place(v, k)
                     if rec is None:
                         continue
-                    if self._feasible_from(i + 1, best_cost):
+                    if self._feasible_from(best_cost):
                         chosen = rec
                         colors.append(k)
                         break
-                    self._undo(i, rec)
+                    self._undo(rec)
                 if chosen is None:  # pragma: no cover - best_cost is achievable
                     raise SolverError("求解器在构造字典序最小方案时失败")
-                pinned.append((i, chosen))
-        finally:
-            for i, rec in reversed(pinned):
-                self._undo(i, rec)
-        return colors
+                pinned.append((v, chosen))
+        except BaseException:
+            for _v, rec in reversed(pinned):
+                self._undo(rec)
+            raise
+        return colors, pinned
 
     def find_other(self, best_cost, exclude):
         """Return a canonical optimum different from ``exclude``, or ``None``."""
@@ -424,7 +494,7 @@ class _ExactSearch:
                 self.stop = True
 
         self.hit = hit
-        self._dfs(0)
+        self._dfs()
         return self.other
 
 
@@ -441,7 +511,9 @@ def _solve_exact(order, conflict_edges, stitches):
         best = search.optimize()
         if best is None:
             return {"status": "infeasible"}
-        colors = search.lexmin(best)
+        colors, pinned = search.lexmin(best)
+        for _v, rec in reversed(pinned):
+            search._undo(rec)
         other = search.find_other(best, tuple(colors))
     except _SearchExhausted:
         raise SolverError("求解器未能在限定时间内求得最优解") from None
